@@ -1,0 +1,15 @@
+﻿# Go build outputs
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Local runtime data
+*.db3
+*.db3-*
+*.log
+config.local.yaml
+
+# Generated test fixtures
+/tools/fixtures/generated/
