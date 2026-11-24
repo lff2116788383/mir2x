@@ -1,6 +1,6 @@
 # mir2x Go 服务端复刻工作文档
 
-- 文档版本：v0.3（服务端-only 评审定稿）
+- 文档版本：v0.4（服务端-only 评审定稿）
 - 编写日期：2026-11-24
 - 参考源码：E:\work\game\mir2x
 - 参考提交：58264934b5562cd283db7dc7daddec496b2de86e
@@ -11,7 +11,7 @@
 
 ---
 
-## 0. v0.3 评审补充决议
+## 0. v0.4 评审补充决议
 
 本版根据评审意见调整如下：
 
@@ -22,6 +22,7 @@
 5. 真实地图包属于运营数据，可后续通过配置加载；它不是 Go 服务端代码完成的阻塞项。
 6. 完整服务端指代码、协议、玩法、持久化和运维能力完整；真实世界内容是否可玩取决于后续提供的合法地图数据。
 7. 管理界面确定为 Web 管理台，不保留 FLTK 管理界面，也不把 CLI 作为管理界面交付。
+8. Lua 确定为官方 Lua 5.4 + cgo 桥接，不翻译成 Go；MSYS2 UCRT64/MinGW 仅作为 Windows 构建工具链。
 
 ---
 
@@ -323,27 +324,82 @@ Web 端建议使用 Go embed + html/template 或轻量前端，不引入独立 N
 
 如果要求 FLTK 界面完全一致，需额外 4-6 周，且不建议纳入 v1.0 关键路径。
 
-### 5.5 Lua 运行时
+### 5.5 Lua 运行时处理策略
 
-建议：v1.0 使用官方 Lua 5.4 + cgo，保持与上游 Lua 语义一致。
+结论：v1.0 采用官方 Lua 5.4 桥接，不把 690 个 Lua 脚本翻译成 Go。
 
-原因：
+处理原则是「Go 实现核心玩法，Lua 继续承载内容脚本」：
 
-- 现有脚本使用 Lua 5.3+ 语义，例如整数除法、math.type；
-- 常见纯 Go Lua 实现偏 Lua 5.1，不能直接兼容；
-- 官方 Lua 5.4 能最大程度保证协程、整数、元表和字符串行为一致；
-- cgo 只用于 Lua VM，Go 主业务仍是纯 Go。
+- Go 负责网络、Actor、地图、AOI、战斗、物品、交易、持久化；
+- Lua 负责 NPC 对话、地图事件、任务流程、刷怪和内容编排；
+- Go 通过受控 API 暴露能力给 Lua；
+- Script Engine 做成可替换接口，但不为 v1.0 增加第二套实现。
+
+现有脚本不是简单的配置表：
+
+- 约 690 个脚本、4.4 万行；
+- 约 254 处 uidRemoteCall，分布在约 54 个文件中；
+- 大量脚本使用 coroutine；
+- 存在运行时 load() 动态执行代码；
+- NPC、任务、地图刷怪都有联动的业务状态。
+
+桥接架构：
+
+```text
+Go Actor / Game Systems
+        |
+        v
+Script Engine Interface
+        |
+        v
+Official Lua 5.4 VM (cgo)
+        |
+        v
+server/script/*.lua
+```
 
 设计要求：
 
-- 把 Lua 实现封装在 internal/script 接口后面；
-- 每个 Lua state 与一个 Actor 绑定，禁止跨 goroutine 并发调用；
-- Lua 回调进入 Go 时必须有超时、panic 隔离和取消机制；
-- 脚本协程的 yield/resume 必须映射回 Actor 调度器；
-- 先实现 remote call、协程、任务 FSM、NPC 事件四类 POC。
+- 每个 Actor 一个独立 Lua state，禁止跨 goroutine 并发调用；
+- Lua 调用固定在 Actor 所属 goroutine 内执行；
+- Go 函数只通过白名单 API 暴露；
+- 每个脚本调用都有超时、调用深度和内存限制；
+- Lua 协程的 yield/resume 接入 Actor 定时器和消息调度；
+- uidRemoteCall 按 Actor 请求/响应实现，支持超时和取消；
+- 脚本错误转为可观测告警，不允许单个脚本崩溃整个进程；
+- Lua 不开放 os、io、package 加载任意文件等能力。
 
-如果项目硬性要求完全无 cgo，需要增加 2-4 周做纯 Go Lua 5.4 POC，并保留 20%-30% 的进度风险。
+为什么不翻译成 Go：
 
+- uidRemoteCall 会把 Lua 代码字符串交给目标 Actor 动态执行，不能靠静态翻译解决；
+- Lua 协程的挂起、恢复、超时和取消需要逐段重建状态机；
+- 大量动态表、可变参数和运行时类型会降低 Go 代码的可读性；
+- NPC 和任务文案需要长期维护，翻译后每次改内容都要重新编译和测试；
+- 上游脚本更新无法继续复用；
+- 690 个脚本的人工翻译和回归成本远高于桥接。
+
+桥接与翻译对比：
+
+| 维度 | Lua 桥接 | 翻译成 Go |
+|---|---|---|
+| 行为兼容 | 高，直接运行原脚本 | 低，容易漏状态和边界 |
+| 初始工作量 | 较小 | 大，至少增加 3-6 工程师月 |
+| 后续内容维护 | 高，可继续改 Lua | 低，每次都要改 Go |
+| 性能 | 足够，脚本通常不在热路径 | 更高 |
+| 类型安全 | 较弱，需要检查工具 | 强 |
+| 构建部署 | 需要 cgo 和 Lua 库 | 纯 Go，较简单 |
+| 上游同步 | 高 | 低 |
+
+Lua POC 验收门槛：
+
+1. Go 程序能启动 Lua 5.4 并加载现有脚本；
+2. Go 能绑定函数供 Lua 调用；
+3. Lua 能发起 Actor remote call 并取得结果；
+4. Lua 协程能挂起、定时恢复和取消；
+5. 脚本超时、异常和内存问题不会拖垮服务端；
+6. 用代表性 NPC、地图和任务脚本跑通端到端场景。
+
+如果项目以后硬性要求完全无 cgo，需要单独做纯 Go Lua 5.4 引擎 POC，预计增加 2-4 周，并保留 20%-30% 的进度风险。v1.0 不采用这条路线。
 ### 5.6 服务端数据策略
 
 结论：不需要完整 mir2x_assets，也不需要客户端资源。
@@ -803,12 +859,51 @@ server-go/
 
 ### 13.3 开发环境前置条件
 
+需要区分「构建环境」和「运行环境」。
+
+Go 纯代码本身只需要 Go 工具链，不需要 MSYS2 或 MinGW。以下场景才需要 C 工具链：
+
+- Go 通过 cgo 编译官方 Lua 5.4；
+- 构建 C++ 参考服务端用于差分测试；
+- 使用需要 cgo 的 SQLite 或其他 C 库。
+
+Windows 上 Go 官方工具链只自带 Go 编译器。启用 cgo 时，Go 会调用外部 C 编译器和链接器，所以需要 MSYS2 UCRT64 中的 MinGW-w64 GCC。MSYS2 UCRT64 提供：
+
+- gcc / g++；
+- Windows UCRT 运行库头文件；
+- Lua、SQLite 等 C 库的编译和链接环境；
+- pkg-config、make、ninja 等构建工具；
+- 构建 C++ 参考服务端所需的工具链。
+
+推荐在 MSYS2 UCRT64 终端中安装：
+
+```sh
+pacman -S --needed \
+  mingw-w64-ucrt-x86_64-toolchain \
+  mingw-w64-ucrt-x86_64-cmake \
+  mingw-w64-ucrt-x86_64-ninja \
+  mingw-w64-ucrt-x86_64-pkgconf
+```
+
+安装后检查：
+
+```sh
+gcc --version
+g++ --version
+go env CC CXX CGO_ENABLED
+```
+
+Lua 5.4 建议静态链接进最终二进制。这样生产环境运行 `mir2d.exe` 时不需要安装 MSYS2；MSYS2 只是开发机和 CI 的构建工具。如果采用动态链接，则发布包必须同时带 Lua DLL 和对应运行库。
+
+Linux 构建机使用发行版的 GCC 和 Lua 5.4 开发包即可，最终可构建静态或自包含二进制。
+
 Phase 0 必须先完成：
 
 - 安装并固定 Go 版本；
 - 安装 Git、CMake、Ninja、Python；
-- 安装 MSYS2/UCRT64 或准备 Linux 构建机；
+- 安装 MSYS2 UCRT64/MinGW，或准备 Linux 构建机；
 - 安装 Lua 5.4 开发库、SQLite 开发库；
+- 验证 CGO_ENABLED=1 且能编译一个 cgo 程序；
 - 成功构建 C++ 参考服务端，用于差分测试；
 - 实现 tools/fixturegen，生成测试地图和数据库；
 - 实现 tools/mockclient，打通登录和基础场景；
@@ -824,7 +919,7 @@ Phase 0 必须先完成：
 | D2 | 完整范围 | 当前 mir2x 行为，不含 TODO/旧版 1.45 | 范围不可控，无法估算 |
 | D3 | master/slave | v1.0 单进程，v1.1 分布式 | 增加 4-6 周 |
 | D4 | 管理界面 | Web 管理台功能替代 | 增加 4-6 周 |
-| D5 | Lua | 官方 Lua 5.4 + cgo | 增加 POC 2-4 周和兼容风险 |
+| D5 | Lua | 官方 Lua 5.4 + cgo 桥接，不翻译成 Go | 增加 POC 2-4 周和兼容风险 |
 | D6 | 资源 | 测试用 fixturegen；生产地图包可选外部挂载 | 无真实地图时只能运行测试世界 |
 | D7 | 性能目标 | 1,000 CCU / 8C16G 起步 | 无法定义验收 |
 | D8 | 客户端基线 | tools/mockclient，不依赖真实客户端 | 协议覆盖不足风险增加 |
