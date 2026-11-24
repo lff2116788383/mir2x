@@ -7,6 +7,6 @@ mir2x Go 服务端复刻工程。
 - 客户端不在交付范围
 - 不依赖完整 mir2x_assets
 - 测试使用 tools/mockclient 和 tools/fixturegen
-- Lua 采用官方 Lua 5.4 + cgo 桥接，不翻译成 Go
+- Lua 采用桥接，不翻译成 Go；优先验证纯 Go Lua 引擎，cgo 仅作回退
 
 - [完整复刻工作文档](docs/replication-work-document.md)
